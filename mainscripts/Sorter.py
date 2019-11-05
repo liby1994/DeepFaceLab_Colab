@@ -1,19 +1,26 @@
 ﻿import os
-import sys
-import operator
-import numpy as np
-import cv2
-from shutil import copyfile
-from pathlib import Path
-from utils import Path_utils
-from utils.DFLPNG import DFLPNG
-from utils.DFLJPG import DFLJPG
-from utils.cv2_utils import *
-from facelib import LandmarksProcessor
-from joblib import Subprocessor
 import multiprocessing
-from interact import interact as io
+import operator
+import sys
+from pathlib import Path
+from shutil import copyfile
+
+import cv2
+import numpy as np
+from numpy import linalg as npla
+
+import imagelib
+from facelib import LandmarksProcessor
+from functools import cmp_to_key
 from imagelib import estimate_sharpness
+from interact import interact as io
+from joblib import Subprocessor
+from nnlib import VGGFace
+from utils import Path_utils
+from utils.cv2_utils import *
+from utils.DFLJPG import DFLJPG
+from utils.DFLPNG import DFLPNG
+
 
 class BlurEstimatorSubprocessor(Subprocessor):
     class Cli(Subprocessor.Cli):
@@ -233,7 +240,7 @@ def sort_by_face_pitch(input_path):
             io.log_err ("%s is not a dfl image file" % (filepath.name) )
             trash_img_list.append ( [str(filepath)] )
             continue
-            
+
         pitch_yaw_roll = dflimg.get_pitch_yaw_roll()
         if pitch_yaw_roll is not None:
             pitch, yaw, roll = pitch_yaw_roll
@@ -423,14 +430,11 @@ def sort_by_hist_dissim(input_path):
         else:
             dflimg = None
 
-        if dflimg is None:
-            io.log_err ("%s is not a dfl image file" % (filepath.name) )
-            trash_img_list.append ([str(filepath)])
-            continue
-
         image = cv2_imread(str(filepath))
-        face_mask = LandmarksProcessor.get_image_hull_mask (image.shape, dflimg.get_landmarks())
-        image = (image*face_mask).astype(np.uint8)
+
+        if dflimg is not None:
+            face_mask = LandmarksProcessor.get_image_hull_mask (image.shape, dflimg.get_landmarks())
+            image = (image*face_mask).astype(np.uint8)
 
         img_list.append ([str(filepath), cv2.calcHist([cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)], [0], None, [256], [0, 256]), 0 ])
 
@@ -547,7 +551,7 @@ class FinalLoaderSubprocessor(Subprocessor):
                 self.log_err (e)
                 return [ 1, [str(filepath)] ]
 
-            return [ 0, [str(filepath), sharpness, hist, yaw ] ]
+            return [ 0, [str(filepath), sharpness, hist, yaw, pitch ] ]
 
         #override
         def get_data_name (self, data):
@@ -611,28 +615,35 @@ class FinalHistDissimSubprocessor(Subprocessor):
 
         #override
         def process_data(self, data):
-            idx, img_list = data
-            for i in range( len(img_list) ):
-                score_total = 0
-                for j in range( len(img_list) ):
-                    if i == j:
-                        continue
-                    score_total += cv2.compareHist(img_list[i][2], img_list[j][2], cv2.HISTCMP_BHATTACHARYYA)
-                img_list[i][3] = score_total
-            img_list = sorted(img_list, key=operator.itemgetter(3), reverse=True)
-            return idx, img_list
+            idx, pitch_yaw_img_list = data
+
+            for p in range ( len(pitch_yaw_img_list) ):
+
+                img_list = pitch_yaw_img_list[p]
+                if img_list is not None:
+                    for i in range( len(img_list) ):
+                        score_total = 0
+                        for j in range( len(img_list) ):
+                            if i == j:
+                                continue
+                            score_total += cv2.compareHist(img_list[i][2], img_list[j][2], cv2.HISTCMP_BHATTACHARYYA)
+                        img_list[i][3] = score_total
+
+                    pitch_yaw_img_list[p] = sorted(img_list, key=operator.itemgetter(3), reverse=True)
+
+            return idx, pitch_yaw_img_list
 
         #override
         def get_data_name (self, data):
             return "Bunch of images"
 
     #override
-    def __init__(self, yaws_sample_list ):
-        self.yaws_sample_list = yaws_sample_list
-        self.yaws_sample_list_len = len(yaws_sample_list)
+    def __init__(self, pitch_yaw_sample_list ):
+        self.pitch_yaw_sample_list = pitch_yaw_sample_list
+        self.pitch_yaw_sample_list_len = len(pitch_yaw_sample_list)
 
-        self.yaws_sample_list_idxs = [ i for i in range(self.yaws_sample_list_len) if self.yaws_sample_list[i] is not None ]
-        self.result = [ None for _ in range(self.yaws_sample_list_len) ]
+        self.pitch_yaw_sample_list_idxs = [ i for i in range(self.pitch_yaw_sample_list_len) if self.pitch_yaw_sample_list[i] is not None ]
+        self.result = [ None for _ in range(self.pitch_yaw_sample_list_len) ]
         super().__init__('FinalHistDissimSubprocessor', FinalHistDissimSubprocessor.Cli)
 
     #override
@@ -643,7 +654,7 @@ class FinalHistDissimSubprocessor(Subprocessor):
                                           }
     #override
     def on_clients_initialized(self):
-        io.progress_bar ("Sort by hist-dissim", self.yaws_sample_list_len)
+        io.progress_bar ("Sort by hist-dissim", len(self.pitch_yaw_sample_list_idxs) )
 
     #override
     def on_clients_finalized(self):
@@ -651,15 +662,15 @@ class FinalHistDissimSubprocessor(Subprocessor):
 
     #override
     def get_data(self, host_dict):
-        if len (self.yaws_sample_list_idxs) > 0:
-            idx = self.yaws_sample_list_idxs.pop(0)
+        if len (self.pitch_yaw_sample_list_idxs) > 0:
+            idx = self.pitch_yaw_sample_list_idxs.pop(0)
 
-            return idx, self.yaws_sample_list[idx]
+            return idx, self.pitch_yaw_sample_list[idx]
         return None
 
     #override
     def on_data_return (self, host_dict, data):
-        self.yaws_sample_list_idxs.insert(0, data[0])
+        self.pitch_yaw_sample_list_idxs.insert(0, data[0])
 
     #override
     def on_result (self, host_dict, data, result):
@@ -724,17 +735,140 @@ def sort_final(input_path, include_by_blur=True):
 
             yaws_sample_list[g] = img_list
 
-    yaws_sample_list = FinalHistDissimSubprocessor(yaws_sample_list).run()
 
-    for g in io.progress_bar_generator ( range (grads), "Fetching best"):
+    yaw_pitch_sample_list = [None]*grads
+    pitch_grads = imgs_per_grad
+
+    for g in io.progress_bar_generator ( range (grads), "Sort by pitch"):
         img_list = yaws_sample_list[g]
         if img_list is None:
             continue
 
-        final_img_list += img_list[0:imgs_per_grad]
-        trash_img_list += img_list[imgs_per_grad:]
+        pitch_sample_list = [None]*pitch_grads
+
+        grads_space = np.linspace (-1.0,1.0, pitch_grads )
+
+        for pg in range (pitch_grads):
+
+            pitch = grads_space[pg]
+            next_pitch = grads_space[pg+1] if pg < pitch_grads-1 else pitch
+
+            pitch_samples = []
+            for img in img_list:
+                s_pitch = img[4]
+                if (pg == 0                and s_pitch < next_pitch) or \
+                   (pg < pitch_grads-1     and s_pitch >= pitch and s_pitch < next_pitch) or \
+                   (pg == pitch_grads-1    and s_pitch >= pitch):
+                    pitch_samples += [ img ]
+
+            if len(pitch_samples) > 0:
+                pitch_sample_list[pg] = pitch_samples
+        yaw_pitch_sample_list[g] = pitch_sample_list
+
+    yaw_pitch_sample_list = FinalHistDissimSubprocessor(yaw_pitch_sample_list).run()
+
+    for g in io.progress_bar_generator (range (grads), "Fetching the best"):
+        pitch_sample_list = yaw_pitch_sample_list[g]
+        if pitch_sample_list is None:
+            continue
+
+        n = imgs_per_grad
+
+        while n > 0:
+            n_prev = n
+            for pg in range(pitch_grads):
+                img_list = pitch_sample_list[pg]
+                if img_list is None:
+                    continue
+                final_img_list += [ img_list.pop(0) ]
+                if len(img_list) == 0:
+                    pitch_sample_list[pg] = None
+                n -= 1
+                if n == 0:
+                    break
+            if n_prev == n:
+                break
+
+        for pg in range(pitch_grads):
+            img_list = pitch_sample_list[pg]
+            if img_list is None:
+                continue
+            trash_img_list += img_list
 
     return final_img_list, trash_img_list
+
+
+def sort_by_vggface(input_path):
+    io.log_info ("Sorting by face similarity using VGGFace model...")
+    
+    model = VGGFace()
+
+    final_img_list = []
+    trash_img_list = []
+
+    image_paths = Path_utils.get_image_paths(input_path)
+    img_list = [ (x,) for x in image_paths ]
+    img_list_len = len(img_list)
+    img_list_range = [*range(img_list_len)]
+
+    feats = [None]*img_list_len    
+    for i in io.progress_bar_generator(img_list_range, "Loading"):
+        img = cv2_imread( img_list[i][0] ).astype(np.float32)
+        img = imagelib.normalize_channels (img, 3)
+        img = cv2.resize (img, (224,224) )
+        img = img[..., ::-1]
+        img[..., 0] -= 93.5940
+        img[..., 1] -= 104.7624
+        img[..., 2] -= 129.1863
+        feats[i] = model.predict( img[None,...] )[0]
+
+    tmp = np.zeros( (img_list_len,) )
+    float_inf = float("inf")    
+    for i in io.progress_bar_generator ( range(img_list_len-1), "Sorting" ):  
+        i_feat = feats[i]
+        
+        for j in img_list_range:
+            tmp[j] = npla.norm(i_feat-feats[j]) if j >= i+1 else float_inf
+            
+        idx = np.argmin(tmp)
+        
+        img_list[i+1], img_list[idx] = img_list[idx], img_list[i+1]
+        feats[i+1], feats[idx] = feats[idx], feats[i+1]
+
+    return img_list, trash_img_list
+    
+"""
+    img_list_len = len(img_list)
+    
+    for i in io.progress_bar_generator ( range(img_list_len-1), "Sorting" ):        
+        a = []
+        i_1 = img_list[i][1]
+        
+        
+        for j in range(i+1, img_list_len):
+            a.append ( [ j, np.linalg.norm(i_1-img_list[j][1]) ] )
+        
+        x = sorted(a, key=operator.itemgetter(1) )[0][0]
+        saved = img_list[i+1]
+        img_list[i+1] = img_list[x]
+        img_list[x] = saved
+        
+        
+    q = np.array ( [ x[1] for x in img_list ] )
+    
+    for i in io.progress_bar_generator ( range(img_list_len-1), "Sorting" ):        
+        
+        a = np.linalg.norm( q[i] - q[i+1:], axis=1 )
+        a = i+1+np.argmin(a)        
+        
+        saved = img_list[i+1]
+        img_list[i+1] = img_list[a]
+        img_list[a] = saved
+        
+        saved = q[i+1]
+        q[i+1] = q[a]
+        q[a] = saved
+"""
 
 def final_process(input_path, img_list, trash_img_list):
     if len(trash_img_list) != 0:
@@ -797,6 +931,7 @@ def main (input_path, sort_by_method):
     elif sort_by_method == 'black':         img_list = sort_by_black (input_path)
     elif sort_by_method == 'origname':      img_list, trash_img_list = sort_by_origname (input_path)
     elif sort_by_method == 'oneface':       img_list, trash_img_list = sort_by_oneface_in_image (input_path)
+    elif sort_by_method == 'vggface':       img_list, trash_img_list = sort_by_vggface (input_path)
     elif sort_by_method == 'final':         img_list, trash_img_list = sort_final (input_path)
     elif sort_by_method == 'final-no-blur': img_list, trash_img_list = sort_final (input_path, include_by_blur=False)
 
